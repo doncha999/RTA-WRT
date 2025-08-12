@@ -1,14 +1,16 @@
 #!/bin/bash
-
-# ModemManager Auto-Fix
+# /usr/bin/modemmanager-autofix
+# ModemManager Auto-Fix with Traffic Monitoring
 # Usage: modemmanager-autofix [start|stop|restart|status|fix-now|logs]
 
 # Configuration
 CHECK_INTERVAL=30  # Check every 30 seconds
+TRAFFIC_TIMEOUT=30 # No traffic timeout in seconds
 MAX_RETRIES=3      # Maximum retry attempts
 RETRY_DELAY=10     # Delay between retries
 PID_FILE="/var/run/modemmanager-autofix.pid"
 LOG_FILE="/var/log/modemmanager-autofix.log"
+TRAFFIC_LOG="/tmp/modemmanager-traffic.log"
 
 # Colors for output
 RED='\033[0;31m'
@@ -44,6 +46,289 @@ is_package_installed() {
     local package="$1"
     opkg list-installed | grep -q "^$package " 2>/dev/null
     return $?
+}
+
+get_modem_interface() {
+    # Priority order: check UCI network config first for OpenWrt logical interfaces
+    local wan_interfaces=""
+    
+    # Method 1: Check UCI network configuration for modem-based WAN interfaces
+    if command -v uci >/dev/null 2>&1; then
+        # Look for interfaces using ModemManager protocol
+        for section in $(uci show network | grep "\.proto='modemmanager'" | cut -d'.' -f2 | cut -d'=' -f1 | sort -u); do
+            if [ -n "$section" ]; then
+                wan_interfaces="$wan_interfaces $section"
+                log "DEBUG" "Found ModemManager interface in UCI: $section"
+            fi
+        done
+        
+        # Also check for other modem protocols (qmi, mbim, 3g)
+        for proto in qmi mbim 3g; do
+            for section in $(uci show network | grep "\.proto='$proto'" | cut -d'.' -f2 | cut -d'=' -f1 | sort -u); do
+                if [ -n "$section" ]; then
+                    wan_interfaces="$wan_interfaces $section"
+                    log "DEBUG" "Found $proto interface in UCI: $section"
+                fi
+            done
+        done
+        
+        # If no specific modem protocols found, check if 'wan' interface exists and is configured
+        if [ -z "$wan_interfaces" ]; then
+            if uci show network.wan >/dev/null 2>&1; then
+                local wan_proto=$(uci get network.wan.proto 2>/dev/null)
+                if [ -n "$wan_proto" ]; then
+                    wan_interfaces="wan"
+                    log "DEBUG" "Using default wan interface with protocol: $wan_proto"
+                fi
+            fi
+        fi
+    fi
+    
+    # Method 2: Check if these logical interfaces have corresponding network devices
+    for logical_iface in $wan_interfaces; do
+        # Check if interface has a physical device assigned
+        local device=""
+        if command -v uci >/dev/null 2>&1; then
+            device=$(uci get network.${logical_iface}.device 2>/dev/null)
+            if [ -z "$device" ]; then
+                device=$(uci get network.${logical_iface}.ifname 2>/dev/null)
+            fi
+        fi
+        
+        # If UCI has device info, check if it exists
+        if [ -n "$device" ] && ip link show "$device" >/dev/null 2>&1; then
+            echo "$logical_iface"
+            log "DEBUG" "Selected interface: $logical_iface (device: $device)"
+            return 0
+        fi
+        
+        # If no device specified, the logical interface might still be valid for ifup
+        if [ -n "$logical_iface" ]; then
+            echo "$logical_iface"
+            log "DEBUG" "Selected logical interface: $logical_iface"
+            return 0
+        fi
+    done
+    
+    # Method 3: Fallback to physical interface detection
+    log "DEBUG" "No UCI interfaces found, falling back to physical interface detection"
+    local modem_interfaces=""
+    
+    # Common modem interface patterns
+    for iface in $(ip link show | grep -E "wwan|usb|ppp" | awk -F': ' '{print $2}' | cut -d'@' -f1); do
+        if [ -n "$iface" ]; then
+            modem_interfaces="$modem_interfaces $iface"
+        fi
+    done
+    
+    # Also check for interfaces from mmcli
+    if command -v mmcli >/dev/null 2>&1; then
+        local modem_list=$(mmcli -L 2>/dev/null | grep "Modem/" | awk '{print $1}')
+        for modem in $modem_list; do
+            local bearer_info=$(mmcli -m "${modem##*/}" --list-bearers 2>/dev/null)
+            if [ -n "$bearer_info" ]; then
+                local bearer_id=$(echo "$bearer_info" | grep "Bearer/" | awk '{print $1}' | head -1)
+                if [ -n "$bearer_id" ]; then
+                    local iface=$(mmcli -b "${bearer_id##*/}" 2>/dev/null | grep "interface:" | awk '{print $2}')
+                    if [ -n "$iface" ]; then
+                        modem_interfaces="$modem_interfaces $iface"
+                    fi
+                fi
+            fi
+        done
+    fi
+    
+    # Return first valid physical interface
+    for iface in $modem_interfaces; do
+        if ip link show "$iface" >/dev/null 2>&1; then
+            echo "$iface"
+            log "DEBUG" "Selected physical interface: $iface"
+            return 0
+        fi
+    done
+    
+    log "WARNING" "No modem interface found"
+    return 1
+}
+
+get_interface_traffic() {
+    local interface="$1"
+    if [ -z "$interface" ]; then
+        echo "0 0"
+        return 1
+    fi
+    
+    # For logical interfaces, try to find the actual physical device
+    local physical_dev="$interface"
+    
+    # If this is a logical interface, get the physical device name
+    if command -v uci >/dev/null 2>&1; then
+        local uci_device=$(uci get network.${interface}.device 2>/dev/null)
+        if [ -z "$uci_device" ]; then
+            uci_device=$(uci get network.${interface}.ifname 2>/dev/null)
+        fi
+        if [ -n "$uci_device" ] && ip link show "$uci_device" >/dev/null 2>&1; then
+            physical_dev="$uci_device"
+        fi
+    fi
+    
+    # Also try to find interface via ip route (for active connections)
+    if [ "$physical_dev" = "$interface" ]; then
+        local route_dev=$(ip route show default | grep "dev " | awk '{print $5}' | head -1)
+        if [ -n "$route_dev" ] && ip link show "$route_dev" >/dev/null 2>&1; then
+            physical_dev="$route_dev"
+        fi
+    fi
+    
+    # Get RX and TX bytes from /proc/net/dev
+    local stats=$(grep "$physical_dev:" /proc/net/dev 2>/dev/null)
+    if [ -n "$stats" ]; then
+        # Extract RX bytes (field 2) and TX bytes (field 10)
+        local rx_bytes=$(echo "$stats" | awk '{print $2}')
+        local tx_bytes=$(echo "$stats" | awk '{print $10}')
+        echo "$rx_bytes $tx_bytes"
+        return 0
+    fi
+    
+    log "DEBUG" "No traffic stats found for interface $interface (physical: $physical_dev)"
+    echo "0 0"
+    return 1
+}
+
+check_traffic_activity() {
+    local interface="$1"
+    local current_time=$(date +%s)
+    
+    if [ -z "$interface" ]; then
+        log "WARNING" "No modem interface found for traffic monitoring"
+        return 1
+    fi
+    
+    # Get current traffic stats
+    local current_stats=$(get_interface_traffic "$interface")
+    local current_rx=$(echo "$current_stats" | awk '{print $1}')
+    local current_tx=$(echo "$current_stats" | awk '{print $2}')
+    
+    # Read previous stats if available
+    local prev_time=0
+    local prev_rx=0
+    local prev_tx=0
+    
+    if [ -f "$TRAFFIC_LOG" ]; then
+        local prev_data=$(cat "$TRAFFIC_LOG")
+        prev_time=$(echo "$prev_data" | awk '{print $1}')
+        prev_rx=$(echo "$prev_data" | awk '{print $2}')
+        prev_tx=$(echo "$prev_data" | awk '{print $3}')
+    fi
+    
+    # Save current stats
+    echo "$current_time $current_rx $current_tx" > "$TRAFFIC_LOG"
+    
+    # Check if this is first run
+    if [ "$prev_time" -eq 0 ]; then
+        log "INFO" "Traffic monitoring initialized for interface $interface"
+        return 0
+    fi
+    
+    # Calculate time difference
+    local time_diff=$((current_time - prev_time))
+    
+    # Calculate traffic difference
+    local rx_diff=$((current_rx - prev_rx))
+    local tx_diff=$((current_tx - prev_tx))
+    local total_diff=$((rx_diff + tx_diff))
+    
+    log "DEBUG" "Interface $interface: RX diff: $rx_diff bytes, TX diff: $tx_diff bytes, Time: ${time_diff}s"
+    
+    # Check if no traffic for the specified timeout period
+    if [ "$total_diff" -eq 0 ] && [ "$time_diff" -ge "$TRAFFIC_TIMEOUT" ]; then
+        log "WARNING" "No traffic detected on $interface for ${time_diff}s (threshold: ${TRAFFIC_TIMEOUT}s)"
+        return 1
+    fi
+    
+    return 0
+}
+
+bring_interface_up() {
+    local interface="$1"
+    
+    if [ -z "$interface" ]; then
+        log "ERROR" "No interface specified for ifup"
+        return 1
+    fi
+    
+    log "INFO" "Bringing up interface: $interface"
+    
+    # Method 1: Try OpenWrt network interface management (ifup)
+    if command -v ifup >/dev/null 2>&1; then
+        log "DEBUG" "Attempting ifup for OpenWrt logical interface: $interface"
+        ifup "$interface" 2>/dev/null && {
+            log "SUCCESS" "Interface $interface brought up using ifup"
+            return 0
+        }
+    fi
+    
+    # Method 2: Try ubus network interface management
+    if command -v ubus >/dev/null 2>&1; then
+        log "DEBUG" "Attempting ubus network interface restart: $interface"
+        ubus call network.interface."$interface" down 2>/dev/null
+        sleep 2
+        ubus call network.interface."$interface" up 2>/dev/null && {
+            log "SUCCESS" "Interface $interface restarted using ubus"
+            return 0
+        }
+    fi
+    
+    # Method 3: Get physical device and try ip commands
+    local physical_dev="$interface"
+    if command -v uci >/dev/null 2>&1; then
+        local uci_device=$(uci get network.${interface}.device 2>/dev/null)
+        if [ -z "$uci_device" ]; then
+            uci_device=$(uci get network.${interface}.ifname 2>/dev/null)
+        fi
+        if [ -n "$uci_device" ]; then
+            physical_dev="$uci_device"
+        fi
+    fi
+    
+    if [ "$physical_dev" != "$interface" ] && ip link show "$physical_dev" >/dev/null 2>&1; then
+        log "DEBUG" "Attempting to bring up physical device: $physical_dev"
+        ip link set "$physical_dev" up 2>/dev/null && {
+            log "SUCCESS" "Physical device $physical_dev brought up"
+            sleep 2
+            
+            # Try to get IP via DHCP if no IP assigned
+            local has_ip=$(ip addr show "$physical_dev" | grep -c "inet ")
+            if [ "$has_ip" -eq 0 ]; then
+                log "INFO" "Attempting to get IP address for $physical_dev"
+                if command -v udhcpc >/dev/null 2>&1; then
+                    udhcpc -i "$physical_dev" -n -q 2>/dev/null &
+                elif command -v dhclient >/dev/null 2>&1; then
+                    dhclient "$physical_dev" 2>/dev/null &
+                fi
+            fi
+            return 0
+        }
+    fi
+    
+    # Method 4: Try network reload (OpenWrt specific)
+    if command -v /etc/init.d/network >/dev/null 2>&1; then
+        log "WARNING" "Standard methods failed, attempting network reload"
+        /etc/init.d/network reload 2>/dev/null && {
+            log "SUCCESS" "Network reloaded successfully"
+            return 0
+        }
+    fi
+    
+    # Method 5: Full network restart (last resort)
+    log "WARNING" "Reload failed, attempting full network restart"
+    /etc/init.d/network restart 2>/dev/null && {
+        log "SUCCESS" "Network restarted successfully"
+        return 0
+    }
+    
+    log "ERROR" "Failed to bring up interface $interface"
+    return 1
 }
 
 check_modem_status() {
@@ -164,10 +449,10 @@ monitor_loop() {
     # Write PID file
     echo $$ > "$PID_FILE"
     
-    log "INFO" "Starting ModemManager monitoring loop (PID: $$, interval: ${CHECK_INTERVAL}s)"
+    log "INFO" "Starting ModemManager monitoring loop with traffic monitoring (PID: $$, interval: ${CHECK_INTERVAL}s, traffic timeout: ${TRAFFIC_TIMEOUT}s)"
     
     # Trap signals for clean shutdown
-    trap 'log "INFO" "Received shutdown signal, stopping monitor..."; rm -f "$PID_FILE"; exit 0' TERM INT QUIT
+    trap 'log "INFO" "Received shutdown signal, stopping monitor..."; rm -f "$PID_FILE" "$TRAFFIC_LOG"; exit 0' TERM INT QUIT
     
     # Initial delay to let system boot
     sleep 10
@@ -181,14 +466,36 @@ monitor_loop() {
             continue
         fi
         
+        # Get modem interface for traffic monitoring
+        local modem_interface=$(get_modem_interface)
+        
         # Check modem status
+        local modem_status_ok=true
         if ! check_modem_status; then
+            modem_status_ok=false
             log "ALERT" "Modem issue detected, applying fix..."
             if apply_modemmanager_fix; then
                 log "SUCCESS" "Fix applied successfully, resuming monitoring"
+                modem_status_ok=true
             else
                 log "ERROR" "Fix failed, will retry on next check cycle"
             fi
+        fi
+        
+        # Check traffic activity if modem is working
+        if [ "$modem_status_ok" = true ] && [ -n "$modem_interface" ]; then
+            if ! check_traffic_activity "$modem_interface"; then
+                log "ALERT" "No traffic detected, attempting to bring up interface $modem_interface"
+                if bring_interface_up "$modem_interface"; then
+                    log "SUCCESS" "Interface recovery completed"
+                    # Reset traffic log after interface recovery
+                    rm -f "$TRAFFIC_LOG"
+                else
+                    log "ERROR" "Failed to recover interface"
+                fi
+            fi
+        elif [ "$modem_status_ok" = true ]; then
+            log "DEBUG" "No modem interface found for traffic monitoring"
         fi
         
         sleep $CHECK_INTERVAL
@@ -201,7 +508,7 @@ start_daemon() {
         return 1
     fi
     
-    echo "Starting ModemManager Auto-Fix daemon..."
+    echo "Starting ModemManager Auto-Fix daemon with traffic monitoring..."
     export DAEMON_MODE=1
     nohup "$0" --monitor > /dev/null 2>&1 &
     
@@ -234,7 +541,7 @@ stop_daemon() {
             kill -9 "$pid"
         fi
         
-        rm -f "$PID_FILE"
+        rm -f "$PID_FILE" "$TRAFFIC_LOG"
         echo "ModemManager Auto-Fix stopped"
         return 0
     else
@@ -254,6 +561,41 @@ show_status() {
             echo -e "${GREEN}OK${NC}"
         else
             echo -e "${RED}PROBLEM${NC}"
+        fi
+        
+        # Show modem interface and traffic info
+        local modem_interface=$(get_modem_interface)
+        if [ -n "$modem_interface" ]; then
+            echo -e "Modem interface: ${BLUE}$modem_interface${NC}"
+            
+            # Show UCI config info if available
+            if command -v uci >/dev/null 2>&1; then
+                local proto=$(uci get network.${modem_interface}.proto 2>/dev/null)
+                local device=$(uci get network.${modem_interface}.device 2>/dev/null)
+                if [ -z "$device" ]; then
+                    device=$(uci get network.${modem_interface}.ifname 2>/dev/null)
+                fi
+                
+                if [ -n "$proto" ]; then
+                    echo "Protocol: $proto"
+                fi
+                if [ -n "$device" ]; then
+                    echo "Physical device: $device"
+                fi
+            fi
+            
+            # Show current traffic stats
+            local traffic_stats=$(get_interface_traffic "$modem_interface")
+            local rx_bytes=$(echo "$traffic_stats" | awk '{print $1}')
+            local tx_bytes=$(echo "$traffic_stats" | awk '{print $2}')
+            
+            # Convert to human readable format
+            local rx_mb=$((rx_bytes / 1024 / 1024))
+            local tx_mb=$((tx_bytes / 1024 / 1024))
+            
+            echo "Traffic stats: RX: ${rx_mb}MB, TX: ${tx_mb}MB"
+        else
+            echo -e "Modem interface: ${YELLOW}Not found${NC}"
         fi
         
         # Show last few log entries
@@ -319,6 +661,13 @@ case "$1" in
         echo "  fix-now   - Apply ModemManager fix manually"
         echo "  logs      - Show recent log entries"
         echo "  logs -f   - Follow log entries in real-time"
+        echo ""
+        echo "Features:"
+        echo "  - Monitors ModemManager service health"
+        echo "  - Monitors network traffic (30s timeout)"
+        echo "  - Automatically restarts interfaces on no traffic"
+        echo "  - Auto-recovery with configurable retry attempts"
+        echo "  - OpenWrt logical interface support (wan, etc.)"
         exit 1
         ;;
 esac
