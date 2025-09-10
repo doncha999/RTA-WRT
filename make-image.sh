@@ -42,18 +42,16 @@ kmod-usb-uhci kmod-usb2 kmod-usb-ehci kmod-usb-net-ipheth usbmuxd libusbmuxd-uti
 kmod-phy-broadcom kmod-phylib-broadcom kmod-tg3 libusb-1.0-0 kmod-usb3 kmod-r8169 kmod-lan743x"
 
 # Modem Tools
-PACKAGES+=" modeminfo-serial-zte modeminfo-qmi modeminfo-serial-dell modeminfo-serial-sierra modeminfo-serial-huawei modeminfo-serial-xmm modeminfo-serial-fibocom modeminfo luci-app-modeminfo"
-PACKAGES+=" atinout modemband luci-app-modemband sms-tool luci-app-sms-tool-js luci-app-lite-watchdog luci-app-3ginfo-lite picocom minicom kmod-usb-atm luci-app-droidmodem"
+
+PACKAGES+=" atinout sms-tool luci-app-sms-tool-js luci-app-lite-watchdog picocom minicom kmod-usb-atm "
 
 # Tunnel option
-OPENCLASH+="coreutils-nohup bash dnsmasq-full curl ca-certificates ipset ip-full libcap libcap-bin ruby ruby-yaml kmod-tun kmod-inet-diag unzip kmod-nft-tproxy luci-compat luci luci-base luci-app-openclash"
-NIKKI+="nikki luci-app-nikki"
-PASSWALL+="chinadns-ng dns2socks dns2tcp geoview hysteria ipt2socks microsocks naiveproxy simple-obfs sing-box tcping trojan-plus tuic-client v2ray-core v2ray-plugin xray-core xray-plugin v2ray-geoip v2ray-geosite luci-app-passwall"
+OPENCLASH+="coreutils-nohup bash dnsmasq-full curl ca-certificates ipset ip-full libcap libcap-bin ruby ruby-yaml kmod-tun kmod-inet-diag unzip kmod-nft-tproxy luci-compat luci luci-base"
 
 # Tunnel options handling
- PACKAGES+=" $OPENCLASH $PASSWALL $NIKKI"
+
 # Remote Services
-PACKAGES+=" luci-app-zerotier luci-app-cloudflared tailscale luci-app-tailscale"
+PACKAGES+=" tailscale luci-app-tailscale"
 
 # NAS and Hard disk tools
 PACKAGES+=" luci-app-diskman luci-app-disks-info smartmontools kmod-usb-storage kmod-usb-storage-uas ntfs-3g"
